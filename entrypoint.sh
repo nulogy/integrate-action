@@ -107,7 +107,7 @@ MERGE_COMMIT_MESSAGE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
 merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER_FOR_MERGING}" -H "${API_HEADER}" -d "{\"commit_title\":\"$MERGE_COMMIT_MESSAGE\"}" "${PR_URL}/merge")
 
 if [[ $merge_resp != *"Pull Request successfully merged"* ]]; then
-  echo "Could not merge PR"
+  echo "Could not merge PR. Error from GitHub: '$merge_resp'"
   exit 1
 fi
 
