@@ -31,6 +31,11 @@ USER_URL=$(jq -r ".comment.user.url" "$GITHUB_EVENT_PATH")
 user_resp=$(curl -X GET -s -H "${API_HEADER}" "${USER_URL}")
 USER_FULL_NAME=$(echo "$user_resp" | jq -r ".name")
 
+# add a Thumbs Up reaction to the comment
+COMMENTS_URL=$(jq -r ".comment.url" "$GITHUB_EVENT_PATH")
+PREVIEW_API_HEADER="Accept: application/vnd.github.squirrel-girl-preview+json"
+curl -X POST -s -H "${AUTH_HEADER}" -H "${PREVIEW_API_HEADER}" -d '{ "content": "+1" }' "$COMMENTS_URL/reactions"
+
 if [[ "$USER_FULL_NAME" == "null" ]]; then
   echo "You must have your full name set up on your GitHub user profile so that the integration can be attributed to you!"
   exit 1
