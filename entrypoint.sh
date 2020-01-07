@@ -29,11 +29,10 @@ AUTH_HEADER="Authorization: token $GITHUB_TOKEN"
 
 USER_URL=$(jq -r ".comment.user.url" "$GITHUB_EVENT_PATH")
 user_resp=$(curl -X GET -s -H "${API_HEADER}" "${USER_URL}")
-USER_FULL_NAME=$(echo "$user_resp" | jq -r ".name")
+USER_IDENTIFIER=$(echo "$user_resp" | jq -r ".name")
 
-if [[ "$USER_FULL_NAME" == "null" ]]; then
-  echo "You must have your full name set up on your GitHub user profile so that the integration can be attributed to you!"
-  exit 1
+if [[ "$USER_IDENTIFIER" == "null" ]]; then
+  USER_IDENTIFIER=$(jq -r ".comment.user.login" "$GITHUB_EVENT_PATH")
 fi
 
 PR_URL="${URI}/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"
@@ -103,7 +102,7 @@ git push --force-with-lease
 
 # Hit the merge button
 AUTH_HEADER_FOR_MERGING="Authorization: token $GITHUB_TOKEN"
-MERGE_COMMIT_MESSAGE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
+MERGE_COMMIT_MESSAGE="Merge branch '$HEAD_BRANCH' on behalf of $USER_IDENTIFIER"
 merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER_FOR_MERGING}" -H "${API_HEADER}" -d "{\"commit_title\":\"$MERGE_COMMIT_MESSAGE\"}" "${PR_URL}/merge")
 
 if [[ $merge_resp != *"Pull Request successfully merged"* ]]; then
