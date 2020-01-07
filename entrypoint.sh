@@ -110,6 +110,3 @@ if [[ $merge_resp != *"Pull Request successfully merged"* ]]; then
   echo "Could not merge PR. Error from GitHub: '$merge_resp'"
   exit 1
 fi
-
-# clean up branch
-git push --delete origin $HEAD_BRANCH
