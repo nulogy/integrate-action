@@ -6,6 +6,9 @@ set -e
 # See how it was before: https://developer.github.com/actions/creating-github-actions/accessing-the-runtime-environment/#exit-codes-and-statuses
 NEUTRAL_EXIT_CODE=0
 
+# since https://github.blog/2022-04-12-git-security-vulnerability-announced/
+git config --global --add safe.directory /github/workspace
+
 # Skip if not a PR
 echo "Checking if issue is a pull request..."
 (jq -r ".issue.pull_request.url" "$GITHUB_EVENT_PATH") || exit $NEUTRAL_EXIT_CODE
