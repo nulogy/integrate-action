@@ -41,6 +41,7 @@ curl -X POST -s -H "${AUTH_HEADER}" -H "${PREVIEW_API_HEADER}" -d '{ "content": 
 
 if [[ "$USER_FULL_NAME" == "null" ]]; then
   echo "USER_URL: $USER_URL"
+  echo "USER_RESPONSE: $user_resp"
   echo "You must have your full name set up on your GitHub user profile so that the integration can be attributed to you!"
   exit 1
 fi
