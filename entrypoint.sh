@@ -31,7 +31,8 @@ API_HEADER="Accept: application/vnd.github.v3+json"
 AUTH_HEADER="Authorization: token $GITHUB_TOKEN"
 
 USER_URL=$(jq -r ".comment.user.url" "$GITHUB_EVENT_PATH")
-user_resp=$(curl -X GET -s -H "${API_HEADER}" "${USER_URL}")
+user_resp=$(curl -X GET -s -H "${API_HEADER}" -H "${AUTH_HEADER}" "${USER_URL}")
+
 USER_FULL_NAME=$(echo "$user_resp" | jq -r ".name")
 
 # add a Thumbs Up reaction to the comment
@@ -40,7 +41,6 @@ PREVIEW_API_HEADER="Accept: application/vnd.github.squirrel-girl-preview+json"
 curl -X POST -s -H "${AUTH_HEADER}" -H "${PREVIEW_API_HEADER}" -d '{ "content": "+1" }' "$COMMENTS_URL/reactions"
 
 if [[ "$USER_FULL_NAME" == "null" ]]; then
-  echo "USER_URL: $USER_URL"
   echo "USER_RESPONSE: $user_resp"
   echo "You must have your full name set up on your GitHub user profile so that the integration can be attributed to you!"
   exit 1
@@ -112,9 +112,8 @@ git rebase origin/$BASE_BRANCH
 git push --force-with-lease
 
 # Hit the merge button
-AUTH_HEADER_FOR_MERGING="Authorization: token $GITHUB_TOKEN"
 MERGE_COMMIT_MESSAGE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
-merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER_FOR_MERGING}" -H "${API_HEADER}" -d "{\"commit_title\":\"$MERGE_COMMIT_MESSAGE\"}" "${PR_URL}/merge")
+merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "{\"commit_title\":\"$MERGE_COMMIT_MESSAGE\"}" "${PR_URL}/merge")
 
 if [[ $merge_resp != *"Pull Request successfully merged"* ]]; then
   echo "Could not merge PR. Error from GitHub: '$merge_resp'"
