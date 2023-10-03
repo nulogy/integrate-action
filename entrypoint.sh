@@ -53,11 +53,6 @@ pr_resp=$(curl -X GET -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${PR_URL}")
 BASE_REPO=$(echo "$pr_resp" | jq -r .base.repo.full_name)
 BASE_BRANCH=$(echo "$pr_resp" | jq -r .base.ref)
 
-if [[ "$(echo "$pr_resp" | jq -r .rebaseable)" != "true" ]]; then
-  echo "GitHub doesn't think that the PR is rebaseable!"
-  exit 1
-fi
-
 if [[ -z "$BASE_BRANCH" ]]; then
   echo "Cannot get base branch information for PR #$PR_NUMBER!"
   echo "API response: $pr_resp"
