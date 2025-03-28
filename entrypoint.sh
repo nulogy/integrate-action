@@ -52,6 +52,7 @@ pr_resp=$(curl -X GET -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${PR_URL}")
 
 BASE_REPO=$(echo "$pr_resp" | jq -r .base.repo.full_name)
 BASE_BRANCH=$(echo "$pr_resp" | jq -r .base.ref)
+PR_TITLE=$(echo "$pr_resp" | jq -r .title)
 
 if [[ -z "$BASE_BRANCH" ]]; then
   echo "Cannot get base branch information for PR #$PR_NUMBER!"
@@ -106,9 +107,36 @@ git checkout $HEAD_BRANCH
 git rebase origin/$BASE_BRANCH
 git push --force-with-lease
 
-# Hit the merge button
-MERGE_COMMIT_MESSAGE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
-merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "{\"commit_title\":\"$MERGE_COMMIT_MESSAGE\"}" "${PR_URL}/merge")
+if [[ $ADD_CHANGE_LOGS = "true" ]]; then
+  # Get Change Logs
+  COMMENT_TOKEN="(?i)change\\\\s?log:?"
+
+  PR_COMMENTS_URL="$URI/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+  GITHUB_PR_COMMENTS=$(curl -X GET -s -H "${API_HEADER}" -H "${AUTH_HEADER}" "${PR_COMMENTS_URL}")
+
+  MESSAGE=$(echo $GITHUB_PR_COMMENTS | jq ".[].body | select(test(\"$COMMENT_TOKEN\")) | sub(\"$COMMENT_TOKEN\"; \"\")" | tr -d '"')
+  TRIMMED_MESSAGE=$(echo "$MESSAGE" | sed 's/^[[:space:]]*//')
+  NEWLINE_MESSAGE=$( sed 's/\\r\\n/\'$'\n''/g' <<< "$TRIMMED_MESSAGE" )
+
+  # Hit the merge button
+  MERGE_COMMIT_TITLE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
+
+  MERGE_COMMIT_MESSAGE="\
+  $PR_TITLE
+
+  Change Log
+  https://github.com/$GITHUB_REPOSITORY/pulls/$PR_NUMBER
+  ${NEWLINE_MESSAGE}"
+
+  JSON_STRING=$( jq -n \
+                --arg title "$MERGE_COMMIT_TITLE" \
+                --arg message "$MERGE_COMMIT_MESSAGE" \
+                '{commit_title: $title, commit_message: $message}' )
+
+  merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "$JSON_STRING" "${PR_URL}/merge")
+else
+  merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "{\"commit_title\":\"$MERGE_COMMIT_TITLE\"}" "${PR_URL}/merge")
+fi
 
 if [[ $merge_resp != *"Pull Request successfully merged"* ]]; then
   echo "Could not merge PR. Error from GitHub: '$merge_resp'"
