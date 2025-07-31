@@ -2,11 +2,7 @@
 
 set -e
 
-# Script version for debugging
-echo "=== Integrate Action v1.1.0 - Change Log Fix ==="
-echo "Running with change log variable expansion fix"
-echo "Timestamp: $(date)"
-echo "=============================================="
+echo "Integrate Action v1.1.1"
 
 # Workaround until new Actions support neutral strategy
 # See how it was before: https://developer.github.com/actions/creating-github-actions/accessing-the-runtime-environment/#exit-codes-and-statuses
@@ -114,21 +110,14 @@ git rebase origin/$BASE_BRANCH
 git push --force-with-lease
 
 if [[ $ADD_CHANGE_LOGS = "true" ]]; then
-  # Get Change Logs
-  echo "Processing change log comments..."
   COMMENT_TOKEN="(?i)change\\\\s?log:?"
 
   PR_COMMENTS_URL="$URI/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
   GITHUB_PR_COMMENTS=$(curl -X GET -s -H "${API_HEADER}" -H "${AUTH_HEADER}" "${PR_COMMENTS_URL}")
 
   MESSAGE=$(echo $GITHUB_PR_COMMENTS | jq ".[].body | select(test(\"$COMMENT_TOKEN\")) | sub(\"$COMMENT_TOKEN\"; \"\")" | tr -d '"')
-  echo "DEBUG: Raw MESSAGE: '$MESSAGE'"
-  
   TRIMMED_MESSAGE=$(echo "$MESSAGE" | sed 's/^[[:space:]]*//')
-  echo "DEBUG: TRIMMED_MESSAGE: '$TRIMMED_MESSAGE'"
-  
-  NEWLINE_MESSAGE=$( sed 's/\\r\\n/\'$'\n''/g' <<< "$TRIMMED_MESSAGE" )
-  echo "DEBUG: NEWLINE_MESSAGE: '$NEWLINE_MESSAGE'"
+  NEWLINE_MESSAGE=$( sed 's/\\r\\n/\'$'\n''/g' <<< "$TRIMMED_MESSAGE" | sed 's/^/  /' )
 
   # Hit the merge button
   MERGE_COMMIT_TITLE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
