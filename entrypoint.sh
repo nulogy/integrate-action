@@ -20,6 +20,17 @@ if [[ "$(jq -r ".action" "$GITHUB_EVENT_PATH")" != "created" ]]; then
   exit $NEUTRAL_EXIT_CODE
 fi
 
+COMMENT_BODY=$(jq -r ".comment.body" "$GITHUB_EVENT_PATH")
+if [[ "$COMMENT_BODY" == *"/hotfix"* ]]; then
+  ACTION_MODE="hotfix"
+elif [[ "$COMMENT_BODY" == *"/integrate"* ]]; then
+  ACTION_MODE="integrate"
+else
+  echo "Comment does not contain /integrate or /hotfix. Skipping."
+  exit $NEUTRAL_EXIT_CODE
+fi
+echo "Action mode: $ACTION_MODE"
+
 PR_NUMBER=$(jq -r ".issue.number" "$GITHUB_EVENT_PATH")
 echo "Collecting information about PR #$PR_NUMBER of $GITHUB_REPOSITORY..."
 
@@ -109,6 +120,12 @@ git checkout $HEAD_BRANCH
 git rebase origin/$BASE_BRANCH
 git push --force-with-lease
 
+# Hit the merge button
+MERGE_COMMIT_TITLE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
+if [[ "$ACTION_MODE" == "hotfix" ]]; then
+  MERGE_COMMIT_TITLE="$MERGE_COMMIT_TITLE [skip tests]"
+fi
+
 if [[ $ADD_CHANGE_LOGS = "true" ]]; then
   COMMENT_TOKEN="(?i)change\\\\s?log:?"
 
@@ -118,9 +135,6 @@ if [[ $ADD_CHANGE_LOGS = "true" ]]; then
   MESSAGE=$(echo $GITHUB_PR_COMMENTS | jq ".[].body | select(test(\"$COMMENT_TOKEN\")) | sub(\"$COMMENT_TOKEN\"; \"\")" | tr -d '"')
   TRIMMED_MESSAGE=$(echo "$MESSAGE" | sed 's/^[[:space:]]*//')
   NEWLINE_MESSAGE=$( sed 's/\\r\\n/\'$'\n''/g' <<< "$TRIMMED_MESSAGE" | sed 's/^/  /' )
-
-  # Hit the merge button
-  MERGE_COMMIT_TITLE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
 
   MERGE_COMMIT_MESSAGE="\
   $PR_TITLE
