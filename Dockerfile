@@ -5,7 +5,7 @@ LABEL repository="http://github.com/nulogy/packmanager"
 LABEL homepage="http://github.com/nulogy/packmanager"
 LABEL maintainer="Nulogy Engineering"
 LABEL "com.github.actions.name"="Integrate"
-LABEL "com.github.actions.description"="Integrate a PR on '/integrate' comment"
+LABEL "com.github.actions.description"="Integrate or hotfix a PR on '/integrate' or '/hotfix' comment"
 LABEL "com.github.actions.icon"="git-pull-request"
 LABEL "com.github.actions.color"="purple"
 
