@@ -94,6 +94,34 @@ assert_eq "required cancelled superseded by rerun success: no failure" "" \
 assert_eq "empty required list: no failures" "" \
   "$(required_checks_failures "$ALL_GREEN" "")"
 
+echo "# required names tolerate surrounding whitespace"
+assert_eq "spaces after commas: none pending" "" \
+  "$(required_checks_pending "$ALL_GREEN" "test, client_test, e2e")"
+assert_eq "spaces around names: no failures" "" \
+  "$(required_checks_failures "$ALL_GREEN" " test ,client_test, e2e ")"
+
+echo "# latest run per name is by id, so a newer run is never masked by an older one"
+# Newer run (higher id) is still queued but has a null started_at.
+RERUN_ID_QUEUED='{"total_count":2,"check_runs":[
+  {"name":"e2e","status":"completed","conclusion":"success","started_at":"2026-07-02T10:00:00Z","id":100},
+  {"name":"e2e","status":"queued","conclusion":null,"started_at":null,"id":200}]}'
+# Newer run (higher id) completed as a failure, older as success.
+RERUN_ID_FAILED='{"total_count":2,"check_runs":[
+  {"name":"e2e","status":"completed","conclusion":"success","started_at":"2026-07-02T10:00:00Z","id":100},
+  {"name":"e2e","status":"completed","conclusion":"failure","started_at":null,"id":200}]}'
+assert_eq "newer queued run counts as incomplete" "1" "$(check_runs_incomplete_count "$RERUN_ID_QUEUED")"
+assert_eq "newer queued run keeps required pending" "e2e" "$(required_checks_pending "$RERUN_ID_QUEUED" "e2e")"
+assert_eq "newer failing run is not masked by older success" "e2e: failure" "$(check_runs_failures "$RERUN_ID_FAILED")"
+assert_eq "newer failing required run reported" "e2e: failure" "$(required_checks_failures "$RERUN_ID_FAILED" "e2e")"
+
+echo "# a null check-run name must not crash the required-checks gate"
+NULL_NAME='{"total_count":2,"check_runs":[
+  {"name":null,"status":"completed","conclusion":"failure","started_at":"2026-07-02T10:00:00Z","id":1},
+  {"name":"e2e","status":"completed","conclusion":"success","started_at":"2026-07-02T10:00:00Z","id":2}]}'
+assert_eq "null name ignored: none pending" "" "$(required_checks_pending "$NULL_NAME" "e2e")"
+assert_eq "null name ignored: no failures" "" "$(required_checks_failures "$NULL_NAME" "e2e")"
+assert_eq "null name ignored: 0 incomplete" "0" "$(check_runs_incomplete_count "$NULL_NAME")"
+
 echo "# any_path_has_prefix"
 FILES_MIXED=$'SensrTrxMES/app/x.js\nPackManager/db/schema.rb'
 FILES_PM_ONLY=$'PackManager/db/schema.rb\n.github/workflows/integrate.yml'

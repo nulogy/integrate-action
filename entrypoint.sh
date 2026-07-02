@@ -116,14 +116,25 @@ git push --force-with-lease
 HEAD_BRANCH_HEAD=$(git rev-parse HEAD)
 echo "(Potentially) Rebased commit hash of HEAD is: $HEAD_BRANCH_HEAD"
 
-# Does the PR touch any of the given comma-separated path prefixes? Paginates
-# the PR file list and stops at the first match.
+# Does the PR touch any of the given comma-separated path prefixes? Paginates the
+# PR file list. Returns 0 (in scope) on a match OR if the file list can't be
+# fetched (fail-closed: an undeterminable scope must not silently weaken the
+# gate); returns 1 only when the full file list is known and matches nothing.
 pr_touches_paths() {
   local prefixes_csv="$1" page=1 resp count files
   while : ; do
-    resp=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${PR_URL}/files?per_page=100&page=$page")
-    if ! jq -e 'type == "array"' <<<"$resp" >/dev/null 2>&1; then
-      return 1
+    resp=""
+    for _ in 1 2 3; do
+      resp=$(curl -s --max-time 30 -H "${AUTH_HEADER}" -H "${API_HEADER}" "${PR_URL}/files?per_page=100&page=$page") || resp=""
+      if [[ -n "$resp" ]] && jq -e 'type == "array"' <<<"$resp" >/dev/null 2>&1; then
+        break
+      fi
+      resp=""
+      sleep 3
+    done
+    if [[ -z "$resp" ]]; then
+      echo "Could not fetch changed files after retries; enforcing required checks (fail-closed)." >&2
+      return 0
     fi
     count=$(jq 'length' <<<"$resp")
     if [[ "$count" -eq 0 ]]; then
@@ -168,8 +179,13 @@ while true; do
     exit 1
   fi
 
-  status_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/status")
-  STATUS_STATE=$(echo "$status_json" | jq -r ".state")
+  status_json=$(curl -s --max-time 30 -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/status") || {
+    echo "Polling for CI: status fetch failed (transient), retrying..."
+    continue
+  }
+  # An error/rate-limit body, or a non-JSON edge response, must not abort the
+  # run: fall back to "null" so the case below simply keeps polling.
+  STATUS_STATE=$(jq -r '.state // "null"' <<<"$status_json" 2>/dev/null || echo "null")
   case "$STATUS_STATE" in
     success) ;;                                     # legacy CI passed; check the check-runs next
     failure|error)
@@ -180,7 +196,10 @@ while true; do
       continue ;;
   esac
 
-  check_runs_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/check-runs")
+  check_runs_json=$(curl -s --max-time 30 -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/check-runs") || {
+    echo "Polling for CI: check-runs fetch failed (transient), retrying..."
+    continue
+  }
   if ! check_runs_payload_valid "$check_runs_json"; then
     echo "Polling for CI: check-runs endpoint returned no usable payload, retrying..."
     continue
