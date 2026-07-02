@@ -4,7 +4,10 @@ Fork of the `cirrus-actions/rebase` repo for integrating a PR.
 
 Supports two commands:
 
-- `/integrate` -- Rebases, waits for CI, and merges the PR.
+- `/integrate` -- Rebases, waits for CI, and merges the PR. "CI" means both the
+  legacy commit statuses (e.g. Buildkite) **and** all GitHub Actions check-runs
+  on the rebased commit; the merge proceeds only when every one has completed and
+  passed (a `success`, `neutral`, or `skipped` conclusion).
 - `/hotfix` -- Same as integrate, but appends `[skip tests]` to the merge commit message.
 
 # Example Usage
@@ -44,4 +47,13 @@ Supports two commands:
 Then on a PR, type `/integrate` or `/hotfix` into the comments section. Using `/hotfix` will add `[skip tests]` to the merge commit message.
 
 This will fail if the HEAD branch is not rebaseable on top of the BASE branch of the PR and the HEAD branch needs to be rebased.
+
+# Versioning
+
+This action is released as git tags. Reference a tag for stable behavior, e.g. `nulogy/integrate-action@v2.0.0`.
+
+- `v2.0.0` -- waits for GitHub Actions check-runs in addition to legacy commit statuses before merging. Use this in repos whose CI runs (partly) on GitHub Actions, e.g. monorepos.
+- `v1.1.1` -- legacy behavior: waits only on the combined commit-status API (check-runs are ignored). Pin this if you rely on the old behavior.
+
+`@master` tracks the latest release.
 
