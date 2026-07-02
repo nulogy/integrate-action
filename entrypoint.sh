@@ -101,29 +101,26 @@ git push --force-with-lease
 HEAD_BRANCH_HEAD=$(git rev-parse HEAD)
 echo "(Potentially) Rebased commit hash of HEAD is: $HEAD_BRANCH_HEAD"
 
-# Give Buildkite and GitHub Actions a moment to register their status/check-runs
-# on the freshly force-pushed commit before we trust an empty result set.
-sleep 45
-
-# Wait for BOTH CI systems to report on the rebased commit:
+# Wait for BOTH CI systems to report on the rebased commit ($HEAD_BRANCH_HEAD):
 #   - PackManager CI (Buildkite) -> legacy commit status (/status)
 #   - SFac CI (GitHub Actions)   -> check-runs (/check-runs), invisible to /status
+# No pre-loop settle is needed: Buildkite posts a pending status within seconds
+# of the force-push and holds it for minutes (until its build finishes), so this
+# loop keeps waiting long after the Actions check-runs have registered.
 while true; do
+  sleep 10
+
   status_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/status")
   STATUS_STATE=$(echo "$status_json" | jq -r ".state")
-
   if [[ "$STATUS_STATE" == "pending" ]]; then
     echo "Polling for CI: legacy statuses still pending..."
-    sleep 10
     continue
   fi
 
   check_runs_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/check-runs")
   incomplete=$(check_runs_incomplete_count "$check_runs_json")
-
   if [[ "$incomplete" -gt 0 ]]; then
     echo "Polling for CI: $incomplete check-run(s) still running..."
-    sleep 10
     continue
   fi
 
