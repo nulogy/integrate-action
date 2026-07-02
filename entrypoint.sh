@@ -46,6 +46,21 @@ URI=https://api.github.com
 API_HEADER="Accept: application/vnd.github.v3+json"
 AUTH_HEADER="Authorization: token $GITHUB_TOKEN"
 
+# CI-wait configuration (all optional; defaults preserve prior behavior).
+# Max seconds to wait for CI before giving up (fail-closed). Must exceed the
+# slowest check (spark's SFac e2e has run ~2.6h) yet stay under this job's own
+# timeout (GitHub's default is 6h).
+CI_WAIT_TIMEOUT_SECONDS="${CI_WAIT_TIMEOUT_SECONDS:-14400}"
+# Comma-separated check-run names that MUST be present and pass before merging.
+# When empty, the action instead gates on every check-run present on the commit
+# (it cannot otherwise tell which checks are expected).
+REQUIRED_CHECK_RUNS="${REQUIRED_CHECK_RUNS:-}"
+# Comma-separated path prefixes. When set, REQUIRED_CHECK_RUNS is enforced only
+# if the PR changes a file under one of these prefixes, so a PR that doesn't
+# touch the relevant product isn't blocked waiting for checks that never run.
+# When empty but REQUIRED_CHECK_RUNS is set, the required checks always apply.
+REQUIRED_CHECK_RUNS_PATHS="${REQUIRED_CHECK_RUNS_PATHS:-}"
+
 USER_URL=$(jq -r ".comment.user.url" "$GITHUB_EVENT_PATH")
 user_resp=$(curl -X GET -s -H "${API_HEADER}" -H "${AUTH_HEADER}" "${USER_URL}")
 
@@ -101,50 +116,112 @@ git push --force-with-lease
 HEAD_BRANCH_HEAD=$(git rev-parse HEAD)
 echo "(Potentially) Rebased commit hash of HEAD is: $HEAD_BRANCH_HEAD"
 
+# Does the PR touch any of the given comma-separated path prefixes? Paginates
+# the PR file list and stops at the first match.
+pr_touches_paths() {
+  local prefixes_csv="$1" page=1 resp count files
+  while : ; do
+    resp=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${PR_URL}/files?per_page=100&page=$page")
+    if ! jq -e 'type == "array"' <<<"$resp" >/dev/null 2>&1; then
+      return 1
+    fi
+    count=$(jq 'length' <<<"$resp")
+    if [[ "$count" -eq 0 ]]; then
+      return 1
+    fi
+    files=$(jq -r '.[].filename' <<<"$resp")
+    if any_path_has_prefix "$files" "$prefixes_csv"; then
+      return 0
+    fi
+    if [[ "$count" -lt 100 ]]; then
+      return 1
+    fi
+    page=$((page + 1))
+  done
+}
+
+# Enforce REQUIRED_CHECK_RUNS on this PR only when in scope (see config above).
+required_active="false"
+if [[ -n "$REQUIRED_CHECK_RUNS" ]]; then
+  if [[ -z "$REQUIRED_CHECK_RUNS_PATHS" ]] || pr_touches_paths "$REQUIRED_CHECK_RUNS_PATHS"; then
+    required_active="true"
+  fi
+fi
+if [[ "$required_active" == "true" ]]; then
+  echo "Required check-runs enforced for this PR: $REQUIRED_CHECK_RUNS"
+else
+  echo "No required check-runs in scope; gating on every check-run present on the commit."
+fi
+
 # Wait for BOTH CI systems to report on the rebased commit ($HEAD_BRANCH_HEAD):
 #   - PackManager CI (Buildkite) -> legacy commit status (/status)
 #   - SFac CI (GitHub Actions)   -> check-runs (/check-runs), invisible to /status
 # No pre-loop settle is needed: Buildkite posts a pending status within seconds
 # of the force-push and holds it for minutes (until its build finishes), so this
 # loop keeps waiting long after the Actions check-runs have registered.
+deadline=$(( $(date +%s) + CI_WAIT_TIMEOUT_SECONDS ))
 while true; do
   sleep 10
 
+  if (( $(date +%s) > deadline )); then
+    echo "Timed out after ${CI_WAIT_TIMEOUT_SECONDS}s waiting for CI on $HEAD_BRANCH @ $HEAD_BRANCH_HEAD. Cancelling integration."
+    exit 1
+  fi
+
   status_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/status")
   STATUS_STATE=$(echo "$status_json" | jq -r ".state")
-  if [[ "$STATUS_STATE" == "pending" ]]; then
-    echo "Polling for CI: legacy statuses still pending..."
+  case "$STATUS_STATE" in
+    success) ;;                                     # legacy CI passed; check the check-runs next
+    failure|error)
+      echo "CI did not pass (legacy status = $STATUS_STATE) for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD. Cancelling integration."
+      exit 1 ;;
+    *)                                              # "pending", or "null" from a transient error body
+      echo "Polling for CI: legacy statuses not final yet ($STATUS_STATE)..."
+      continue ;;
+  esac
+
+  check_runs_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/check-runs")
+  if ! check_runs_payload_valid "$check_runs_json"; then
+    echo "Polling for CI: check-runs endpoint returned no usable payload, retrying..."
     continue
   fi
 
-  check_runs_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/check-runs")
-  incomplete=$(check_runs_incomplete_count "$check_runs_json")
-  if [[ "$incomplete" -gt 0 ]]; then
-    echo "Polling for CI: $incomplete check-run(s) still running..."
-    continue
+  if [[ "$required_active" == "true" ]]; then
+    pending=$(required_checks_pending "$check_runs_json" "$REQUIRED_CHECK_RUNS")
+    if [[ -n "$pending" ]]; then
+      echo "Polling for CI: waiting on required check-run(s): $(echo "$pending" | tr '\n' ' ')"
+      continue
+    fi
+  else
+    incomplete=$(check_runs_incomplete_count "$check_runs_json")
+    if [[ "$incomplete" -gt 0 ]]; then
+      echo "Polling for CI: $incomplete check-run(s) still running..."
+      continue
+    fi
   fi
 
   break
 done
 
-if [[ "$STATUS_STATE" != "success" ]]; then
-  echo "CI did not pass (legacy status = $STATUS_STATE) for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD. Cancelling integration."
-  exit 1
+# Reaching here means the legacy status is "success"; fail on any check-run problem.
+if [[ "$required_active" == "true" ]]; then
+  required_failures=$(required_checks_failures "$check_runs_json" "$REQUIRED_CHECK_RUNS")
+  if [[ -n "$required_failures" ]]; then
+    echo "CI did not pass. Required check-run problem(s) for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
+    echo "$required_failures"
+    exit 1
+  fi
+else
+  failed_runs=$(check_runs_failures "$check_runs_json")
+  if [[ -n "$failed_runs" ]]; then
+    echo "CI did not pass. Failing check-runs for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
+    echo "$failed_runs"
+    exit 1
+  fi
 fi
 
-failed_runs=$(check_runs_failures "$check_runs_json")
-if [[ -n "$failed_runs" ]]; then
-  echo "CI did not pass. Failing check-runs for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
-  echo "$failed_runs"
-  exit 1
-fi
-
-# Rebase
-git checkout $HEAD_BRANCH
-git rebase origin/$BASE_BRANCH
-git push --force-with-lease
-
-# Hit the merge button
+# Hit the merge button. Pass sha=$HEAD_BRANCH_HEAD so GitHub only merges if the
+# branch head still matches the exact commit CI validated (a race push aborts).
 MERGE_COMMIT_TITLE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
 if [[ "$ACTION_MODE" == "hotfix" ]]; then
   MERGE_COMMIT_TITLE="$MERGE_COMMIT_TITLE [skip tests]"
@@ -170,11 +247,17 @@ if [[ $ADD_CHANGE_LOGS = "true" ]]; then
   JSON_STRING=$( jq -n \
                 --arg title "$MERGE_COMMIT_TITLE" \
                 --arg message "$MERGE_COMMIT_MESSAGE" \
-                '{commit_title: $title, commit_message: $message}' )
+                --arg sha "$HEAD_BRANCH_HEAD" \
+                '{commit_title: $title, commit_message: $message, sha: $sha}' )
 
   merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "$JSON_STRING" "${PR_URL}/merge")
 else
-  merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "{\"commit_title\":\"$MERGE_COMMIT_TITLE\"}" "${PR_URL}/merge")
+  JSON_STRING=$( jq -n \
+                --arg title "$MERGE_COMMIT_TITLE" \
+                --arg sha "$HEAD_BRANCH_HEAD" \
+                '{commit_title: $title, sha: $sha}' )
+
+  merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "$JSON_STRING" "${PR_URL}/merge")
 fi
 
 if [[ $merge_resp != *"Pull Request successfully merged"* ]]; then
