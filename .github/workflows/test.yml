@@ -1,0 +1,12 @@
+name: Test
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+jobs:
+  ci_checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ci_checks unit tests
+        run: bash test/ci_checks_test.sh
