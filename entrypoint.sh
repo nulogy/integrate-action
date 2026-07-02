@@ -2,7 +2,7 @@
 
 set -e
 
-echo "Integrate Action v1.1.1"
+echo "Integrate Action v2.0.0"
 
 # Workaround until new Actions support neutral strategy
 # See how it was before: https://developer.github.com/actions/creating-github-actions/accessing-the-runtime-environment/#exit-codes-and-statuses
@@ -10,6 +10,9 @@ NEUTRAL_EXIT_CODE=0
 
 # since https://github.blog/2022-04-12-git-security-vulnerability-announced/
 git config --global --add safe.directory /github/workspace
+
+# shellcheck source=ci_checks.sh
+source /ci_checks.sh
 
 # Skip if not a PR
 echo "Checking if issue is a pull request..."
@@ -98,20 +101,44 @@ git push --force-with-lease
 HEAD_BRANCH_HEAD=$(git rev-parse HEAD)
 echo "(Potentially) Rebased commit hash of HEAD is: $HEAD_BRANCH_HEAD"
 
-# Poll for CI status
+# Give Buildkite and GitHub Actions a moment to register their status/check-runs
+# on the freshly force-pushed commit before we trust an empty result set.
+sleep 45
+
+# Wait for BOTH CI systems to report on the rebased commit:
+#   - PackManager CI (Buildkite) -> legacy commit status (/status)
+#   - SFac CI (GitHub Actions)   -> check-runs (/check-runs), invisible to /status
 while true; do
-  sleep 10
+  status_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/status")
+  STATUS_STATE=$(echo "$status_json" | jq -r ".state")
 
-  LAST_STATUS=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/status" | jq -r ".state")
-
-  if [[ $LAST_STATUS != "pending" ]]; then
-    break
+  if [[ "$STATUS_STATE" == "pending" ]]; then
+    echo "Polling for CI: legacy statuses still pending..."
+    sleep 10
+    continue
   fi
-  echo "Polling for CI build completion..."
+
+  check_runs_json=$(curl -s -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/check-runs")
+  incomplete=$(check_runs_incomplete_count "$check_runs_json")
+
+  if [[ "$incomplete" -gt 0 ]]; then
+    echo "Polling for CI: $incomplete check-run(s) still running..."
+    sleep 10
+    continue
+  fi
+
+  break
 done
 
-if [[ $LAST_STATUS != "success" ]]; then
-  echo "CI did not pass for branch $HEAD_BRANCH and HEAD commit $HEAD_BRANCH_HEAD. Cancelling integration."
+if [[ "$STATUS_STATE" != "success" ]]; then
+  echo "CI did not pass (legacy status = $STATUS_STATE) for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD. Cancelling integration."
+  exit 1
+fi
+
+failed_runs=$(check_runs_failures "$check_runs_json")
+if [[ -n "$failed_runs" ]]; then
+  echo "CI did not pass. Failing check-runs for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
+  echo "$failed_runs"
   exit 1
 fi
 
