@@ -4,13 +4,13 @@ Fork of the `cirrus-actions/rebase` repo for integrating a PR.
 
 Supports two commands:
 
-- `/integrate` -- Rebases, waits for CI, and merges the PR. "CI" means the legacy
-  commit statuses (e.g. Buildkite) **and** GitHub Actions check-runs on the
-  rebased commit. The merge proceeds only when the legacy status is `success` and
-  every check-run present on the commit has completed with a `success`, `neutral`,
-  or `skipped` conclusion. See [Configuration](#configuration) for
-  `REQUIRED_CHECK_RUNS`, which additionally waits for a named set of checks to
-  *appear* so a PR can't merge in the window before its checks have registered.
+- `/integrate` -- Rebases, waits for CI, and merges the PR. "CI" spans a commit's
+  GitHub Actions check-runs **and** legacy status contexts (e.g. Buildkite),
+  read together via GitHub's GraphQL `statusCheckRollup`. The merge proceeds only
+  when every check present on the commit has completed with a `success`,
+  `neutral`, or `skipped` conclusion. See [Configuration](#configuration) for
+  `REQUIRED_CHECKS`, which additionally waits for named checks to *appear* so a PR
+  can't merge in the window before its checks have registered.
 - `/hotfix` -- Same as integrate, but appends `[skip tests]` to the merge commit message.
 
 # Example Usage
@@ -60,20 +60,18 @@ All optional, passed via `env:` on the action step:
 | `GITHUB_TOKEN` | — | **Required.** Token allowed to merge into the PR's base branch. |
 | `ADD_CHANGE_LOGS` | `false` | Collect `Change log:` PR comments into the merge commit message. |
 | `CI_WAIT_TIMEOUT_SECONDS` | `14400` (4h) | Give up waiting for CI after this many seconds (fail, don't merge). Keep it above your slowest check and below the job's own timeout (GitHub's default is 6h). |
-| `REQUIRED_CHECK_RUNS` | _(empty)_ | Comma-separated check-run names that must be **present** (and pass) before merging. The action *always* requires every check-run present on the commit to pass; this list additionally requires the named checks to have appeared, closing the window where a check hasn't registered yet and an empty/partial set looks "green". You do **not** add every new check here — a new check is caught by the always-on "all present must pass" rule — but keep at least one reliably-running check named as an anchor, so the wait can't finish before the suite registers. |
-| `REQUIRED_CHECK_RUNS_PATHS` | _(empty)_ | Comma-separated path **prefixes**. When set, `REQUIRED_CHECK_RUNS` is enforced only if the PR changes a file under one of them — so a PR that doesn't touch the relevant product isn't blocked waiting for checks that never run. When empty, `REQUIRED_CHECK_RUNS` always applies. |
+| `REQUIRED_CHECKS` | _(empty)_ | JSON array of rules pairing path prefixes with check names that must be **present** (and pass) before merging — matching GitHub Actions check-runs *and* legacy status contexts (e.g. `buildkite/packmanager`). A rule with no `paths` always applies; with `paths` it applies only when the PR changes a file under one of those prefixes. The action *always* requires every check present on the commit to pass; these rules additionally require the named checks to have appeared, closing the window where a check hasn't registered yet and an empty/partial set looks "green". You do **not** list every check — a new check is caught by the always-on "all present must pass" rule — but name at least one reliably-running check per product as an anchor. Example: `[{"checks":["buildkite/packmanager"]},{"paths":["some/dir/"],"checks":["test","e2e"]}]` |
 
-Example (a monorepo whose SFac product's tests run as GitHub Actions):
+Example (a monorepo: Buildkite gates one product, GitHub Actions gates another):
 
 ```yml
       - uses: nulogy/integrate-action@v2.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_MERGING_TOKEN }}
-          REQUIRED_CHECK_RUNS: "test,client_test,e2e"
-          REQUIRED_CHECK_RUNS_PATHS: "SensrTrxMES/"
+          REQUIRED_CHECKS: '[{"checks":["buildkite/packmanager"]},{"paths":["SensrTrxMES/"],"checks":["test","client_test","e2e"]}]'
 ```
 
-**Requirement:** the action waits on the legacy combined-status API and merges only when it reports `success`, so a repo must have **at least one legacy commit status** (e.g. Buildkite) that stays `pending` through its build. A pure-GitHub-Actions repo with no legacy statuses is not yet supported — the combined status reads `pending` indefinitely and the action will wait until it times out.
+The check state is read from GitHub's GraphQL `statusCheckRollup`, so Actions check-runs and legacy status contexts are gated the same way — the action works for Actions-only, status-only, or mixed repos, and needs no branch-protection required checks. (Only the first 100 contexts on a commit are considered.)
 
 # Versioning
 

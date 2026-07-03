@@ -48,18 +48,17 @@ AUTH_HEADER="Authorization: token $GITHUB_TOKEN"
 
 # CI-wait configuration (all optional; defaults preserve prior behavior).
 # Max seconds to wait for CI before giving up (fail-closed). Must exceed the
-# slowest check (spark's SFac e2e has run ~2.6h) yet stay under this job's own
-# timeout (GitHub's default is 6h).
+# slowest check yet stay under this job's own timeout (GitHub's default is 6h).
 CI_WAIT_TIMEOUT_SECONDS="${CI_WAIT_TIMEOUT_SECONDS:-14400}"
-# Comma-separated check-run names that MUST be present and pass before merging.
-# When empty, the action instead gates on every check-run present on the commit
-# (it cannot otherwise tell which checks are expected).
-REQUIRED_CHECK_RUNS="${REQUIRED_CHECK_RUNS:-}"
-# Comma-separated path prefixes. When set, REQUIRED_CHECK_RUNS is enforced only
-# if the PR changes a file under one of these prefixes, so a PR that doesn't
-# touch the relevant product isn't blocked waiting for checks that never run.
-# When empty but REQUIRED_CHECK_RUNS is set, the required checks always apply.
-REQUIRED_CHECK_RUNS_PATHS="${REQUIRED_CHECK_RUNS_PATHS:-}"
+# JSON array of rules pairing path prefixes with required check names, e.g.
+#   [ {"checks":["buildkite/packmanager"]},
+#     {"paths":["some/dir/"],"checks":["test","e2e"]} ]
+# A rule with no "paths" is always required; with "paths" it applies only when the
+# PR changes a file under one of those prefixes. A required check must be PRESENT
+# (and pass) before merging. Names match both GitHub Actions check-runs and legacy
+# commit-status contexts (e.g. "buildkite/packmanager"). When empty, the action
+# gates only on whatever checks are present on the commit.
+REQUIRED_CHECKS="${REQUIRED_CHECKS:-}"
 
 USER_URL=$(jq -r ".comment.user.url" "$GITHUB_EVENT_PATH")
 user_resp=$(curl -X GET -s -H "${API_HEADER}" -H "${AUTH_HEADER}" "${USER_URL}")
@@ -151,25 +150,49 @@ pr_touches_paths() {
   done
 }
 
-# Enforce REQUIRED_CHECK_RUNS on this PR only when in scope (see config above).
-required_active="false"
-if [[ -n "$REQUIRED_CHECK_RUNS" ]]; then
-  if [[ -z "$REQUIRED_CHECK_RUNS_PATHS" ]] || pr_touches_paths "$REQUIRED_CHECK_RUNS_PATHS"; then
-    required_active="true"
+# Build the set of required check names for this PR from REQUIRED_CHECKS (see
+# config above). A rule with no "paths" always applies; otherwise it applies when
+# the PR changes a file under one of its prefixes. Names may refer to check-runs
+# or legacy status contexts.
+required_names=""
+if [[ -n "$REQUIRED_CHECKS" ]]; then
+  if jq -e 'type == "array"' <<<"$REQUIRED_CHECKS" >/dev/null 2>&1; then
+    rule_count=$(jq 'length' <<<"$REQUIRED_CHECKS")
+    i=0
+    # Extract each rule's fields by index (not via read+IFS: a tab delimiter is
+    # IFS-whitespace, which would drop an empty "paths" field and misread the row).
+    while [[ "$i" -lt "$rule_count" ]]; do
+      rule_paths=$(jq -r --argjson i "$i" '(.[$i].paths // []) | join(",")' <<<"$REQUIRED_CHECKS")
+      rule_checks=$(jq -r --argjson i "$i" '(.[$i].checks // []) | join(",")' <<<"$REQUIRED_CHECKS")
+      i=$((i + 1))
+      if [[ -z "$rule_checks" ]]; then
+        continue
+      fi
+      if [[ -z "$rule_paths" ]] || pr_touches_paths "$rule_paths"; then
+        required_names="${required_names:+$required_names,}$rule_checks"
+      fi
+    done
+  else
+    echo "REQUIRED_CHECKS is not a JSON array; ignoring it." >&2
   fi
 fi
-if [[ "$required_active" == "true" ]]; then
-  echo "Required check-runs enforced for this PR: $REQUIRED_CHECK_RUNS"
+if [[ -n "$required_names" ]]; then
+  echo "Required checks for this PR: $required_names"
 else
-  echo "No required check-runs in scope; gating on every check-run present on the commit."
+  echo "No required checks in scope; gating on every check present on the commit."
 fi
 
-# Wait for BOTH CI systems to report on the rebased commit ($HEAD_BRANCH_HEAD):
-#   - PackManager CI (Buildkite) -> legacy commit status (/status)
-#   - SFac CI (GitHub Actions)   -> check-runs (/check-runs), invisible to /status
-# No pre-loop settle is needed: Buildkite posts a pending status within seconds
-# of the force-push and holds it for minutes (until its build finishes), so this
-# loop keeps waiting long after the Actions check-runs have registered.
+# Poll the commit's checks via one GraphQL statusCheckRollup query, which returns
+# legacy status contexts (e.g. Buildkite) AND GitHub Actions check-runs together,
+# so both are gated uniformly.
+OWNER="${GITHUB_REPOSITORY%%/*}"
+REPO="${GITHUB_REPOSITORY##*/}"
+# $owner/$name/$oid are GraphQL variables, not shell -- single quotes are correct.
+# shellcheck disable=SC2016
+GQL_QUERY='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion startedAt databaseId} ... on StatusContext{context state createdAt}}}}}}}}'
+
+# No pre-loop settle is needed: the required-check anchor below holds the loop
+# until the expected checks have registered.
 deadline=$(( $(date +%s) + CI_WAIT_TIMEOUT_SECONDS ))
 while true; do
   sleep 10
@@ -179,70 +202,54 @@ while true; do
     exit 1
   fi
 
-  status_json=$(curl -s --max-time 30 -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/status") || {
-    echo "Polling for CI: status fetch failed (transient), retrying..."
+  gql_payload=$(jq -n --arg q "$GQL_QUERY" --arg owner "$OWNER" --arg name "$REPO" --arg oid "$HEAD_BRANCH_HEAD" \
+    '{query: $q, variables: {owner: $owner, name: $name, oid: $oid}}')
+  rollup_resp=$(curl -s --max-time 30 -H "${AUTH_HEADER}" -H "Content-Type: application/json" -d "$gql_payload" "${URI}/graphql") || {
+    echo "Polling for CI: rollup fetch failed (transient), retrying..."
     continue
   }
-  # An error/rate-limit body, or a non-JSON edge response, must not abort the
-  # run: fall back to "null" so the case below simply keeps polling.
-  STATUS_STATE=$(jq -r '.state // "null"' <<<"$status_json" 2>/dev/null || echo "null")
-  case "$STATUS_STATE" in
-    success) ;;                                     # legacy CI passed; check the check-runs next
-    failure|error)
-      echo "CI did not pass (legacy status = $STATUS_STATE) for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD. Cancelling integration."
-      exit 1 ;;
-    *)                                              # "pending", or "null" from a transient error body
-      echo "Polling for CI: legacy statuses not final yet ($STATUS_STATE)..."
-      continue ;;
-  esac
-
-  check_runs_json=$(curl -s --max-time 30 -H "${AUTH_HEADER}" -H "${API_HEADER}" "${URI}/repos/$GITHUB_REPOSITORY/commits/$HEAD_BRANCH_HEAD/check-runs") || {
-    echo "Polling for CI: check-runs fetch failed (transient), retrying..."
-    continue
-  }
-  if ! check_runs_payload_valid "$check_runs_json"; then
-    echo "Polling for CI: check-runs endpoint returned no usable payload, retrying..."
+  if ! rollup_payload_valid "$rollup_resp"; then
+    echo "Polling for CI: rollup response not usable yet, retrying..."
     continue
   fi
+  check_runs_json=$(normalize_rollup "$rollup_resp")
 
-  # When in scope, wait for the named required checks to APPEAR and finish. This
-  # anchors the wait: because sibling checks register together, a newly-added
-  # check will have registered by the time the anchor has, so the "all present"
-  # wait below then covers it without it being listed in REQUIRED_CHECK_RUNS.
-  if [[ "$required_active" == "true" ]]; then
-    pending=$(required_checks_pending "$check_runs_json" "$REQUIRED_CHECK_RUNS")
+  # Wait for the required checks to APPEAR and finish. This anchors the wait:
+  # because sibling checks register together, a newly-added check will have
+  # registered by the time an anchor has, so the "all present" wait below then
+  # covers it without it being listed in REQUIRED_CHECKS.
+  if [[ -n "$required_names" ]]; then
+    pending=$(required_checks_pending "$check_runs_json" "$required_names")
     if [[ -n "$pending" ]]; then
-      echo "Polling for CI: waiting on required check-run(s): $(echo "$pending" | tr '\n' ' ')"
+      echo "Polling for CI: waiting on required check(s): $(echo "$pending" | tr '\n' ' ')"
       continue
     fi
   fi
 
-  # Wait for every check-run present on the commit to finish.
+  # Wait for every check present on the commit to finish.
   incomplete=$(check_runs_incomplete_count "$check_runs_json")
   if [[ "$incomplete" -gt 0 ]]; then
-    echo "Polling for CI: $incomplete check-run(s) still running..."
+    echo "Polling for CI: $incomplete check(s) still running..."
     continue
   fi
 
   break
 done
 
-# Reaching here means the legacy status is "success". Every check-run present on
-# the commit must have concluded acceptably...
+# Every check present on the commit must have concluded acceptably...
 failed_runs=$(check_runs_failures "$check_runs_json")
 if [[ -n "$failed_runs" ]]; then
-  echo "CI did not pass. Failing check-runs for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
+  echo "CI did not pass. Failing checks for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
   echo "$failed_runs"
   exit 1
 fi
 
-# ...and, when in scope, the named required checks must additionally be PRESENT
-# (not merely "not failing") -- this is what guarantees we didn't merge before
-# they ran.
-if [[ "$required_active" == "true" ]]; then
-  required_failures=$(required_checks_failures "$check_runs_json" "$REQUIRED_CHECK_RUNS")
+# ...and the required checks must additionally be PRESENT (not merely "not
+# failing") -- this is what guarantees we didn't merge before they ran.
+if [[ -n "$required_names" ]]; then
+  required_failures=$(required_checks_failures "$check_runs_json" "$required_names")
   if [[ -n "$required_failures" ]]; then
-    echo "CI did not pass. Required check-run problem(s) for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
+    echo "CI did not pass. Required check problem(s) for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
     echo "$required_failures"
     exit 1
   fi
