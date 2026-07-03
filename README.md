@@ -36,6 +36,10 @@ Supports two commands:
           - uses: nulogy/integrate-action@master
             env:
               GITHUB_TOKEN: ${{ secrets.GITHUB_MERGING_TOKEN }}
+              # Strongly recommended (see Configuration): require your CI checks to be
+              # present and pass. Without it, the action gates only on whatever checks
+              # happen to exist when it polls.
+              REQUIRED_CHECKS: '[{"checks":["your-ci-check"]}]'
       always_job:
         name: Aways run job
         runs-on: ubuntu-latest
@@ -71,7 +75,13 @@ Example (a monorepo: Buildkite gates one product, GitHub Actions gates another):
           REQUIRED_CHECKS: '[{"checks":["buildkite/packmanager"]},{"paths":["SensrTrxMES/"],"checks":["test","client_test","e2e"]}]'
 ```
 
-The check state is read from GitHub's GraphQL `statusCheckRollup`, so Actions check-runs and legacy status contexts are gated the same way — the action works for Actions-only, status-only, or mixed repos, and needs no branch-protection required checks. (Only the first 100 contexts on a commit are considered.)
+Notes:
+
+- Check state is read from GitHub's GraphQL `statusCheckRollup`, so Actions check-runs and legacy status contexts are gated the same way — the action works for Actions-only, status-only, or mixed repos, and needs no branch-protection required checks.
+- Without `REQUIRED_CHECKS` the action still won't merge on an *empty* check set (it waits for at least one check to appear), but it can only gate on whatever has appeared by then; set `REQUIRED_CHECKS` to guarantee specific checks ran.
+- Each anchor should be a check that registers no later than the checks it stands in for (prefer a fast-registering check-run over a slow external status), so the "all present" rule can't finish before a sibling has appeared.
+- Check names and path prefixes must not contain commas.
+- If a commit has more than 100 checks, the action refuses to merge (it cannot see them all) rather than merging on a partial view.
 
 # Versioning
 

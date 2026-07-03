@@ -162,8 +162,10 @@ if [[ -n "$REQUIRED_CHECKS" ]]; then
     # Extract each rule's fields by index (not via read+IFS: a tab delimiter is
     # IFS-whitespace, which would drop an empty "paths" field and misread the row).
     while [[ "$i" -lt "$rule_count" ]]; do
-      rule_paths=$(jq -r --argjson i "$i" '(.[$i].paths // []) | join(",")' <<<"$REQUIRED_CHECKS")
-      rule_checks=$(jq -r --argjson i "$i" '(.[$i].checks // []) | join(",")' <<<"$REQUIRED_CHECKS")
+      # Type-guard so a malformed rule (e.g. checks as a string, or a non-object)
+      # yields "" and is skipped, rather than erroring out and aborting under set -e.
+      rule_paths=$(jq -r --argjson i "$i" '(.[$i]) as $r | if ($r | type) == "object" and (($r.paths | type) == "array") then ($r.paths | map(select(type == "string")) | join(",")) else "" end' <<<"$REQUIRED_CHECKS")
+      rule_checks=$(jq -r --argjson i "$i" '(.[$i]) as $r | if ($r | type) == "object" and (($r.checks | type) == "array") then ($r.checks | map(select(type == "string")) | join(",")) else "" end' <<<"$REQUIRED_CHECKS")
       i=$((i + 1))
       if [[ -z "$rule_checks" ]]; then
         continue
@@ -189,7 +191,7 @@ OWNER="${GITHUB_REPOSITORY%%/*}"
 REPO="${GITHUB_REPOSITORY##*/}"
 # $owner/$name/$oid are GraphQL variables, not shell -- single quotes are correct.
 # shellcheck disable=SC2016
-GQL_QUERY='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion startedAt databaseId} ... on StatusContext{context state createdAt}}}}}}}}'
+GQL_QUERY='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100){totalCount nodes{__typename ... on CheckRun{name status conclusion startedAt databaseId} ... on StatusContext{context state createdAt}}}}}}}}'
 
 # No pre-loop settle is needed: the required-check anchor below holds the loop
 # until the expected checks have registered.
@@ -212,6 +214,13 @@ while true; do
     echo "Polling for CI: rollup response not usable yet, retrying..."
     continue
   fi
+  # Refuse to merge on a partial view: the rollup returns at most 100 contexts,
+  # so if the commit has more, some checks are invisible to us.
+  context_total=$(jq '.data.repository.object.statusCheckRollup.contexts.totalCount // 0' <<<"$rollup_resp")
+  if [[ "$context_total" -gt 100 ]]; then
+    echo "Commit $HEAD_BRANCH_HEAD has $context_total checks; only 100 are fetched. Refusing to merge on a partial view. Cancelling integration."
+    exit 1
+  fi
   check_runs_json=$(normalize_rollup "$rollup_resp")
 
   # Wait for the required checks to APPEAR and finish. This anchors the wait:
@@ -222,6 +231,17 @@ while true; do
     pending=$(required_checks_pending "$check_runs_json" "$required_names")
     if [[ -n "$pending" ]]; then
       echo "Polling for CI: waiting on required check(s): $(echo "$pending" | tr '\n' ' ')"
+      continue
+    fi
+  fi
+
+  # Floor for the no-required-checks mode: never merge on an empty check set --
+  # wait until at least one check has appeared so an unregistered CI run can't
+  # look "green". (With REQUIRED_CHECKS set, the anchor above already does this.)
+  if [[ -z "$required_names" ]]; then
+    present_count=$(jq '.check_runs | length' <<<"$check_runs_json")
+    if [[ "$present_count" -eq 0 ]]; then
+      echo "Polling for CI: no checks have appeared on the commit yet, retrying..."
       continue
     fi
   fi
