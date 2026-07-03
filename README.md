@@ -63,7 +63,8 @@ All optional, passed via `env:` on the action step:
 |---|---|---|
 | `GITHUB_TOKEN` | — | **Required.** Token allowed to merge into the PR's base branch. |
 | `ADD_CHANGE_LOGS` | `false` | Collect `Change log:` PR comments into the merge commit message. |
-| `CI_WAIT_TIMEOUT_SECONDS` | `14400` (4h) | Give up waiting for CI after this many seconds (fail, don't merge). Keep it above your slowest check and below the job's own timeout (GitHub's default is 6h). |
+| `CI_WAIT_TIMEOUT_SECONDS` | `7200` (2h) | Give up waiting for CI after this many seconds **per rebase attempt** (fail, don't merge). Must be a positive integer (no leading zeros / units) and above your slowest required check, or the action cancels a healthy PR. |
+| `MAX_REBASE_ATTEMPTS` | `100` | How many times to rebase onto the latest base and re-run CI when the base advances during CI. High by default (set-and-forget); the enclosing job's own `timeout-minutes` is the real backstop for total runtime. Positive integer. |
 | `REQUIRED_CHECKS` | _(empty)_ | JSON array of rules pairing path prefixes with check names that must be **present** (and pass) before merging — matching GitHub Actions check-runs *and* legacy status contexts (e.g. `buildkite/packmanager`). A rule with no `paths` always applies; with `paths` it applies only when the PR changes a file under one of those prefixes. The action *always* requires every check present on the commit to pass; these rules additionally require the named checks to have appeared, closing the window where a check hasn't registered yet and an empty/partial set looks "green". You do **not** list every check — a new check is caught by the always-on "all present must pass" rule — but name at least one reliably-running check per product as an anchor. Example: `[{"checks":["buildkite/packmanager"]},{"paths":["some/dir/"],"checks":["test","e2e"]}]` |
 
 Example (a monorepo: Buildkite gates one product, GitHub Actions gates another):
@@ -79,6 +80,8 @@ Notes:
 
 - Check state is read from GitHub's GraphQL `statusCheckRollup`, so Actions check-runs and legacy status contexts are gated the same way — the action works for Actions-only, status-only, or mixed repos, and needs no branch-protection required checks.
 - Without `REQUIRED_CHECKS` the action still won't merge on an *empty* check set (it waits for at least one check to appear), but it can only gate on whatever has appeared by then; set `REQUIRED_CHECKS` to guarantee specific checks ran.
+- The action waits `CI_WAIT_TIMEOUT_SECONDS` **per rebase attempt** and retries up to `MAX_REBASE_ATTEMPTS` times, so worst-case runtime is roughly `CI_WAIT_TIMEOUT_SECONDS × MAX_REBASE_ATTEMPTS`. For long "set and forget" runs on a busy base, raise the workflow job's `timeout-minutes` (GitHub's default job timeout is 6h) — it, not this action, is the ultimate cap.
+- A `skipped` (or `neutral`) check passes the gate — a skipped check never blocks a merge.
 - Each anchor should be a check that registers no later than the checks it stands in for (prefer a fast-registering check-run over a slow external status), so the "all present" rule can't finish before a sibling has appeared.
 - Check names and path prefixes must not contain commas.
 - If a commit has more than 100 checks, the action refuses to merge (it cannot see them all) rather than merging on a partial view.

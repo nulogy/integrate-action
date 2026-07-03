@@ -46,10 +46,18 @@ URI=https://api.github.com
 API_HEADER="Accept: application/vnd.github.v3+json"
 AUTH_HEADER="Authorization: token $GITHUB_TOKEN"
 
-# CI-wait configuration (all optional; defaults preserve prior behavior).
-# Total seconds to wait for CI, across all rebase retries, before giving up
-# (fail-closed). Keep it under the enclosing job's own timeout (GitHub default 6h).
-CI_WAIT_TIMEOUT_SECONDS="${CI_WAIT_TIMEOUT_SECONDS:-14400}"
+# CI-wait configuration (all optional). NOTE: v2 gates differently from v1 (see
+# the README); leaving these unset does NOT reproduce v1's legacy-status-only gate.
+
+# Seconds to wait for CI PER rebase attempt before giving up (fail-closed). The
+# action retries across rebases (see MAX_REBASE_ATTEMPTS), so total runtime is
+# bounded by the enclosing job's own timeout -- raise the job's timeout-minutes
+# for long "set and forget" runs.
+CI_WAIT_TIMEOUT_SECONDS="${CI_WAIT_TIMEOUT_SECONDS:-7200}"
+# How many times to rebase onto the latest base and re-run CI when the base keeps
+# advancing during CI. High by default so /integrate is "set and forget"; the
+# enclosing job's own timeout is the ultimate backstop.
+MAX_REBASE_ATTEMPTS="${MAX_REBASE_ATTEMPTS:-100}"
 # JSON array of rules pairing path prefixes with required check names, e.g.
 #   [ {"checks":["buildkite/packmanager"]},
 #     {"paths":["some/dir/"],"checks":["test","e2e"]} ]
@@ -59,6 +67,15 @@ CI_WAIT_TIMEOUT_SECONDS="${CI_WAIT_TIMEOUT_SECONDS:-14400}"
 # commit-status contexts (e.g. "buildkite/packmanager"). When empty, the action
 # gates only on whatever checks are present on the commit.
 REQUIRED_CHECKS="${REQUIRED_CHECKS:-}"
+
+# Reject non-positive-integer numeric config up front (e.g. "4h", "0600", "") so
+# it fails clearly instead of yielding a misleading timeout or a wrong bound.
+for _var in CI_WAIT_TIMEOUT_SECONDS MAX_REBASE_ATTEMPTS; do
+  if ! [[ "${!_var}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$_var must be a positive integer, got '${!_var}'. Cancelling integration."
+    exit 1
+  fi
+done
 
 USER_URL=$(jq -r ".comment.user.url" "$GITHUB_EVENT_PATH")
 user_resp=$(curl -X GET -s -H "${API_HEADER}" -H "${AUTH_HEADER}" "${USER_URL}")
@@ -110,9 +127,10 @@ git fetch origin $HEAD_BRANCH
 git checkout -b $HEAD_BRANCH origin/$HEAD_BRANCH
 
 # Does the PR touch any of the given comma-separated path prefixes? Paginates the
-# PR file list. Returns 0 (in scope) on a match OR if the file list can't be
-# fetched (fail-closed: an undeterminable scope must not silently weaken the
-# gate); returns 1 only when the full file list is known and matches nothing.
+# PR file list. Returns 0 on a match, 1 when the full file list is known and
+# matches nothing. If the file list can't be fetched after retries it exits the
+# whole action (fail-closed: an undeterminable scope must not silently weaken the
+# gate, and failing fast beats blocking on a check that will never run).
 pr_touches_paths() {
   local prefixes_csv="$1" page=1 resp count files
   while : ; do
@@ -126,8 +144,8 @@ pr_touches_paths() {
       sleep 3
     done
     if [[ -z "$resp" ]]; then
-      echo "Could not fetch changed files after retries; enforcing required checks (fail-closed)." >&2
-      return 0
+      echo "Could not fetch the PR's changed files after retries; cannot determine required-check scope. Cancelling integration (re-run /integrate)."
+      exit 1
     fi
     count=$(jq 'length' <<<"$resp")
     if [[ "$count" -eq 0 ]]; then
@@ -169,7 +187,8 @@ if [[ -n "$REQUIRED_CHECKS" ]]; then
       fi
     done
   else
-    echo "REQUIRED_CHECKS is not a JSON array; ignoring it." >&2
+    echo "REQUIRED_CHECKS is set but is not a JSON array. Cancelling integration (fix the config)."
+    exit 1
   fi
 fi
 if [[ -n "$required_names" ]]; then
@@ -185,18 +204,13 @@ OWNER="${GITHUB_REPOSITORY%%/*}"
 REPO="${GITHUB_REPOSITORY##*/}"
 # $owner/$name/$oid are GraphQL variables, not shell -- single quotes are correct.
 # shellcheck disable=SC2016
-GQL_QUERY='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100){totalCount nodes{__typename ... on CheckRun{name status conclusion startedAt databaseId} ... on StatusContext{context state createdAt}}}}}}}}'
-
-# One overall CI-wait budget shared across all rebase attempts, so a base that
-# keeps advancing can't run the action past the enclosing job's own timeout.
-deadline=$(( $(date +%s) + CI_WAIT_TIMEOUT_SECONDS ))
+GQL_QUERY='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100){totalCount nodes{__typename ... on CheckRun{name status conclusion startedAt databaseId checkSuite{app{databaseId}}} ... on StatusContext{context state createdAt}}}}}}}}'
 
 # Outer loop: rebase onto the LATEST base, wait for CI, then re-check the base
 # right before merging. If another PR merged during CI (base advanced), re-rebase
 # and re-verify so we never merge a commit that was only CI'd against a stale
 # base. The pre-merge re-check narrows -- but cannot fully close -- this window;
 # the gap between that check and the merge call itself needs a merge queue.
-MAX_REBASE_ATTEMPTS=3
 rebase_attempt=0
 while true; do  # OUTER: rebase / CI / re-check base / merge
   rebase_attempt=$((rebase_attempt + 1))
@@ -219,7 +233,9 @@ while true; do  # OUTER: rebase / CI / re-check base / merge
   HEAD_BRANCH_HEAD=$(git rev-parse HEAD)
   echo "Rebased HEAD is $HEAD_BRANCH_HEAD (attempt $rebase_attempt/$MAX_REBASE_ATTEMPTS onto base $base_sha)"
 
-  # Wait for CI on this rebased commit (against the shared deadline above).
+  # Fresh CI-wait budget for THIS rebase attempt, so a base advance late in one
+  # attempt doesn't starve the next attempt's CI.
+  deadline=$(( $(date +%s) + CI_WAIT_TIMEOUT_SECONDS ))
   while true; do
     sleep 10
 
