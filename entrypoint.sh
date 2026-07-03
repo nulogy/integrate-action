@@ -104,16 +104,10 @@ git remote set-url origin https://x-access-token:$GITHUB_TOKEN@github.com/$GITHU
 git config --global user.email "action@github.com"
 git config --global user.name "GitHub Action"
 
-# Make sure branches are up-to-date
-git fetch origin $BASE_BRANCH
+# Check out the PR branch. The base is (re)fetched and the branch (re)rebased
+# per attempt inside the merge loop below.
 git fetch origin $HEAD_BRANCH
-
-# Rebase
 git checkout -b $HEAD_BRANCH origin/$HEAD_BRANCH
-git rebase origin/$BASE_BRANCH
-git push --force-with-lease
-HEAD_BRANCH_HEAD=$(git rev-parse HEAD)
-echo "(Potentially) Rebased commit hash of HEAD is: $HEAD_BRANCH_HEAD"
 
 # Does the PR touch any of the given comma-separated path prefixes? Paginates the
 # PR file list. Returns 0 (in scope) on a match OR if the file list can't be
@@ -193,11 +187,39 @@ REPO="${GITHUB_REPOSITORY##*/}"
 # shellcheck disable=SC2016
 GQL_QUERY='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100){totalCount nodes{__typename ... on CheckRun{name status conclusion startedAt databaseId} ... on StatusContext{context state createdAt}}}}}}}}'
 
-# No pre-loop settle is needed: the required-check anchor below holds the loop
-# until the expected checks have registered.
-deadline=$(( $(date +%s) + CI_WAIT_TIMEOUT_SECONDS ))
-while true; do
-  sleep 10
+# Outer loop: rebase onto the LATEST base, wait for CI, then re-check the base
+# right before merging. If another PR merged during CI (base advanced), re-rebase
+# and re-verify so we never merge a commit that was only CI'd against a stale
+# base. The pre-merge re-check narrows -- but cannot fully close -- this window;
+# the gap between that check and the merge call itself needs a merge queue.
+MAX_REBASE_ATTEMPTS=3
+rebase_attempt=0
+while true; do  # OUTER: rebase / CI / re-check base / merge
+  rebase_attempt=$((rebase_attempt + 1))
+  if [[ "$rebase_attempt" -gt "$MAX_REBASE_ATTEMPTS" ]]; then
+    echo "Base advanced through $MAX_REBASE_ATTEMPTS CI cycles; giving up. Re-run /integrate."
+    exit 1
+  fi
+
+  git fetch origin $BASE_BRANCH
+  base_sha=$(git rev-parse "origin/$BASE_BRANCH")
+  if ! git rebase "origin/$BASE_BRANCH"; then
+    git rebase --abort || true
+    echo "Cannot rebase $HEAD_BRANCH onto updated $BASE_BRANCH (conflict). Cancelling integration."
+    exit 1
+  fi
+  if ! git push --force-with-lease; then
+    echo "Could not force-push rebased $HEAD_BRANCH (was it pushed to during CI?). Cancelling integration."
+    exit 1
+  fi
+  HEAD_BRANCH_HEAD=$(git rev-parse HEAD)
+  echo "Rebased HEAD is $HEAD_BRANCH_HEAD (attempt $rebase_attempt/$MAX_REBASE_ATTEMPTS onto base $base_sha)"
+
+  # No pre-loop settle is needed: the required-check anchor below holds the loop
+  # until the expected checks have registered.
+  deadline=$(( $(date +%s) + CI_WAIT_TIMEOUT_SECONDS ))
+  while true; do
+    sleep 10
 
   if (( $(date +%s) > deadline )); then
     echo "Timed out after ${CI_WAIT_TIMEOUT_SECONDS}s waiting for CI on $HEAD_BRANCH @ $HEAD_BRANCH_HEAD. Cancelling integration."
@@ -275,6 +297,16 @@ if [[ -n "$required_names" ]]; then
   fi
 fi
 
+# Re-check the base right before merging: if it advanced during CI, another PR
+# merged, so re-rebase and re-verify rather than merge a stale-CI'd commit. This
+# only narrows the race -- the gap between here and the merge call still needs a
+# merge queue to fully close.
+git fetch origin $BASE_BRANCH
+if [[ "$(git rev-parse "origin/$BASE_BRANCH")" != "$base_sha" ]]; then
+  echo "Base advanced during CI; re-rebasing and re-verifying before merge."
+  continue
+fi
+
 # Hit the merge button. Pass sha=$HEAD_BRANCH_HEAD so GitHub only merges if the
 # branch head still matches the exact commit CI validated (a race push aborts).
 MERGE_COMMIT_TITLE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
@@ -319,3 +351,6 @@ if [[ $merge_resp != *"Pull Request successfully merged"* ]]; then
   echo "Could not merge PR. Error from GitHub: '$merge_resp'"
   exit 1
 fi
+
+break  # OUTER: merged successfully
+done
