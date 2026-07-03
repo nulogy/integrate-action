@@ -11,5 +11,6 @@ LABEL "com.github.actions.color"="purple"
 
 RUN apk --no-cache add jq bash curl git git-lfs
 
+ADD ci_checks.sh /ci_checks.sh
 ADD entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
