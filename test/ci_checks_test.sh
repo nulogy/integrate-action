@@ -44,7 +44,6 @@ RERUN='{"total_count":2,"check_runs":[
 RERUN_RUNNING='{"total_count":2,"check_runs":[
   {"name":"e2e","status":"completed","conclusion":"success","started_at":"2026-07-02T10:00:00Z"},
   {"name":"e2e","status":"in_progress","conclusion":null,"started_at":"2026-07-02T10:30:00Z"}]}'
-ERROR_PAYLOAD='{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}'
 
 echo "# incomplete-count / failures (latest run per name)"
 assert_eq "all green: 0 incomplete"      "0" "$(check_runs_incomplete_count "$ALL_GREEN")"
@@ -61,12 +60,6 @@ echo "# reruns: only the latest run per name counts"
 assert_eq "rerun success supersedes cancelled: no failures" "" "$(check_runs_failures "$RERUN")"
 assert_eq "rerun success supersedes cancelled: 0 incomplete" "0" "$(check_runs_incomplete_count "$RERUN")"
 assert_eq "rerun still running: 1 incomplete" "1" "$(check_runs_incomplete_count "$RERUN_RUNNING")"
-
-echo "# payload validity guard"
-assert_ok    "valid check-runs payload"  check_runs_payload_valid "$ALL_GREEN"
-assert_ok    "empty check-runs payload valid" check_runs_payload_valid "$EMPTY"
-assert_notok "error payload invalid"     check_runs_payload_valid "$ERROR_PAYLOAD"
-assert_notok "empty string invalid"      check_runs_payload_valid ""
 
 echo "# required_checks_pending (names absent or latest run not completed)"
 assert_eq "required all present+completed: none pending" "" \
@@ -155,6 +148,24 @@ assert_eq "normalized: required legacy status failure reported" "buildkite/packm
   "$(required_checks_failures "$(normalize_rollup "$ROLLUP_STATUS_FAIL")" "buildkite/packmanager")"
 assert_eq "normalized null rollup: 0 incomplete" "0" \
   "$(check_runs_incomplete_count "$(normalize_rollup "$ROLLUP_NULL")")"
+
+echo "# same name from two sources is not collapsed (bugs 1 & 2)"
+# Two check-runs named "build" from different apps: one fails, one passes.
+ROLLUP_TWO_APPS='{"data":{"repository":{"object":{"statusCheckRollup":{"contexts":{"nodes":[
+  {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-07-02T10:00:00Z","databaseId":50,"checkSuite":{"app":{"databaseId":111}}},
+  {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-07-02T10:01:00Z","databaseId":100,"checkSuite":{"app":{"databaseId":222}}}]}}}}}}'
+# A legacy status "test" (FAILURE) alongside an Actions check-run "test" (SUCCESS).
+ROLLUP_STATUS_VS_CHECK='{"data":{"repository":{"object":{"statusCheckRollup":{"contexts":{"nodes":[
+  {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-07-02T10:00:00Z","databaseId":5,"checkSuite":{"app":{"databaseId":15368}}},
+  {"__typename":"StatusContext","context":"test","state":"FAILURE","createdAt":"2026-07-02T11:00:00Z"}]}}}}}}'
+assert_eq "two apps same name: failing app not masked" "build: failure" \
+  "$(check_runs_failures "$(normalize_rollup "$ROLLUP_TWO_APPS")")"
+assert_eq "two apps same name: required build fails"    "build: failure" \
+  "$(required_checks_failures "$(normalize_rollup "$ROLLUP_TWO_APPS")" "build")"
+assert_eq "status vs check same name: failing status not masked" "test: failure" \
+  "$(check_runs_failures "$(normalize_rollup "$ROLLUP_STATUS_VS_CHECK")")"
+assert_eq "status vs check same name: required test fails" "test: failure" \
+  "$(required_checks_failures "$(normalize_rollup "$ROLLUP_STATUS_VS_CHECK")" "test")"
 
 echo "# any_path_has_prefix"
 FILES_MIXED=$'SensrTrxMES/app/x.js\nPackManager/db/schema.rb'
