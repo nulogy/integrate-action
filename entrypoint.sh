@@ -205,36 +205,45 @@ while true; do
     continue
   fi
 
+  # When in scope, wait for the named required checks to APPEAR and finish. This
+  # anchors the wait: because sibling checks register together, a newly-added
+  # check will have registered by the time the anchor has, so the "all present"
+  # wait below then covers it without it being listed in REQUIRED_CHECK_RUNS.
   if [[ "$required_active" == "true" ]]; then
     pending=$(required_checks_pending "$check_runs_json" "$REQUIRED_CHECK_RUNS")
     if [[ -n "$pending" ]]; then
       echo "Polling for CI: waiting on required check-run(s): $(echo "$pending" | tr '\n' ' ')"
       continue
     fi
-  else
-    incomplete=$(check_runs_incomplete_count "$check_runs_json")
-    if [[ "$incomplete" -gt 0 ]]; then
-      echo "Polling for CI: $incomplete check-run(s) still running..."
-      continue
-    fi
+  fi
+
+  # Wait for every check-run present on the commit to finish.
+  incomplete=$(check_runs_incomplete_count "$check_runs_json")
+  if [[ "$incomplete" -gt 0 ]]; then
+    echo "Polling for CI: $incomplete check-run(s) still running..."
+    continue
   fi
 
   break
 done
 
-# Reaching here means the legacy status is "success"; fail on any check-run problem.
+# Reaching here means the legacy status is "success". Every check-run present on
+# the commit must have concluded acceptably...
+failed_runs=$(check_runs_failures "$check_runs_json")
+if [[ -n "$failed_runs" ]]; then
+  echo "CI did not pass. Failing check-runs for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
+  echo "$failed_runs"
+  exit 1
+fi
+
+# ...and, when in scope, the named required checks must additionally be PRESENT
+# (not merely "not failing") -- this is what guarantees we didn't merge before
+# they ran.
 if [[ "$required_active" == "true" ]]; then
   required_failures=$(required_checks_failures "$check_runs_json" "$REQUIRED_CHECK_RUNS")
   if [[ -n "$required_failures" ]]; then
     echo "CI did not pass. Required check-run problem(s) for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
     echo "$required_failures"
-    exit 1
-  fi
-else
-  failed_runs=$(check_runs_failures "$check_runs_json")
-  if [[ -n "$failed_runs" ]]; then
-    echo "CI did not pass. Failing check-runs for $HEAD_BRANCH @ $HEAD_BRANCH_HEAD:"
-    echo "$failed_runs"
     exit 1
   fi
 fi
