@@ -47,8 +47,8 @@ API_HEADER="Accept: application/vnd.github.v3+json"
 AUTH_HEADER="Authorization: token $GITHUB_TOKEN"
 
 # CI-wait configuration (all optional; defaults preserve prior behavior).
-# Max seconds to wait for CI before giving up (fail-closed). Must exceed the
-# slowest check yet stay under this job's own timeout (GitHub's default is 6h).
+# Total seconds to wait for CI, across all rebase retries, before giving up
+# (fail-closed). Keep it under the enclosing job's own timeout (GitHub default 6h).
 CI_WAIT_TIMEOUT_SECONDS="${CI_WAIT_TIMEOUT_SECONDS:-14400}"
 # JSON array of rules pairing path prefixes with required check names, e.g.
 #   [ {"checks":["buildkite/packmanager"]},
@@ -187,6 +187,10 @@ REPO="${GITHUB_REPOSITORY##*/}"
 # shellcheck disable=SC2016
 GQL_QUERY='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100){totalCount nodes{__typename ... on CheckRun{name status conclusion startedAt databaseId} ... on StatusContext{context state createdAt}}}}}}}}'
 
+# One overall CI-wait budget shared across all rebase attempts, so a base that
+# keeps advancing can't run the action past the enclosing job's own timeout.
+deadline=$(( $(date +%s) + CI_WAIT_TIMEOUT_SECONDS ))
+
 # Outer loop: rebase onto the LATEST base, wait for CI, then re-check the base
 # right before merging. If another PR merged during CI (base advanced), re-rebase
 # and re-verify so we never merge a commit that was only CI'd against a stale
@@ -215,9 +219,7 @@ while true; do  # OUTER: rebase / CI / re-check base / merge
   HEAD_BRANCH_HEAD=$(git rev-parse HEAD)
   echo "Rebased HEAD is $HEAD_BRANCH_HEAD (attempt $rebase_attempt/$MAX_REBASE_ATTEMPTS onto base $base_sha)"
 
-  # No pre-loop settle is needed: the required-check anchor below holds the loop
-  # until the expected checks have registered.
-  deadline=$(( $(date +%s) + CI_WAIT_TIMEOUT_SECONDS ))
+  # Wait for CI on this rebased commit (against the shared deadline above).
   while true; do
     sleep 10
 
@@ -297,18 +299,10 @@ if [[ -n "$required_names" ]]; then
   fi
 fi
 
-# Re-check the base right before merging: if it advanced during CI, another PR
-# merged, so re-rebase and re-verify rather than merge a stale-CI'd commit. This
-# only narrows the race -- the gap between here and the merge call still needs a
-# merge queue to fully close.
-git fetch origin $BASE_BRANCH
-if [[ "$(git rev-parse "origin/$BASE_BRANCH")" != "$base_sha" ]]; then
-  echo "Base advanced during CI; re-rebasing and re-verifying before merge."
-  continue
-fi
-
-# Hit the merge button. Pass sha=$HEAD_BRANCH_HEAD so GitHub only merges if the
-# branch head still matches the exact commit CI validated (a race push aborts).
+# Assemble the merge payload (including fetching change-log comments) BEFORE the
+# base re-check, so the only work left between the re-check and the merge call is
+# the merge itself -- keeping the residual race window as small as possible.
+# sha=$HEAD_BRANCH_HEAD makes GitHub merge only the exact commit CI validated.
 MERGE_COMMIT_TITLE="Merge branch '$HEAD_BRANCH' on behalf of $USER_FULL_NAME"
 if [[ "$ACTION_MODE" == "hotfix" ]]; then
   MERGE_COMMIT_TITLE="$MERGE_COMMIT_TITLE [skip tests]"
@@ -336,16 +330,24 @@ if [[ $ADD_CHANGE_LOGS = "true" ]]; then
                 --arg message "$MERGE_COMMIT_MESSAGE" \
                 --arg sha "$HEAD_BRANCH_HEAD" \
                 '{commit_title: $title, commit_message: $message, sha: $sha}' )
-
-  merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "$JSON_STRING" "${PR_URL}/merge")
 else
   JSON_STRING=$( jq -n \
                 --arg title "$MERGE_COMMIT_TITLE" \
                 --arg sha "$HEAD_BRANCH_HEAD" \
                 '{commit_title: $title, sha: $sha}' )
-
-  merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "$JSON_STRING" "${PR_URL}/merge")
 fi
+
+# Re-check the base as late as possible: if it advanced during CI, another PR
+# merged, so re-rebase and re-verify rather than merge a stale-CI'd commit. The
+# only work after this is the merge PUT itself; the residual gap between here and
+# that call needs a merge queue to fully close.
+git fetch origin $BASE_BRANCH
+if [[ "$(git rev-parse "origin/$BASE_BRANCH")" != "$base_sha" ]]; then
+  echo "Base advanced during CI; re-rebasing and re-verifying before merge."
+  continue
+fi
+
+merge_resp=$(curl -X PUT -s -H "${AUTH_HEADER}" -H "${API_HEADER}" -d "$JSON_STRING" "${PR_URL}/merge")
 
 if [[ $merge_resp != *"Pull Request successfully merged"* ]]; then
   echo "Could not merge PR. Error from GitHub: '$merge_resp'"
