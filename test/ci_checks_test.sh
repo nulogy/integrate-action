@@ -166,6 +166,20 @@ assert_eq "status vs check same name: failing status not masked" "test: failure"
   "$(check_runs_failures "$(normalize_rollup "$ROLLUP_STATUS_VS_CHECK")")"
 assert_eq "status vs check same name: required test fails" "test: failure" \
   "$(required_checks_failures "$(normalize_rollup "$ROLLUP_STATUS_VS_CHECK")" "test")"
+# One source of a required name still running -> the name stays pending.
+ROLLUP_ONE_SOURCE_RUNNING='{"data":{"repository":{"object":{"statusCheckRollup":{"contexts":{"nodes":[
+  {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-07-02T10:00:00Z","databaseId":50,"checkSuite":{"app":{"databaseId":111}}},
+  {"__typename":"CheckRun","name":"build","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-07-02T10:01:00Z","databaseId":100,"checkSuite":{"app":{"databaseId":222}}}]}}}}}}'
+assert_eq "one source running: required build still pending" "build" \
+  "$(required_checks_pending "$(normalize_rollup "$ROLLUP_ONE_SOURCE_RUNNING")" "build")"
+# Both sources of a required name pass -> no failure, nothing pending.
+ROLLUP_TWO_APPS_PASS='{"data":{"repository":{"object":{"statusCheckRollup":{"contexts":{"nodes":[
+  {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-07-02T10:00:00Z","databaseId":50,"checkSuite":{"app":{"databaseId":111}}},
+  {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-07-02T10:01:00Z","databaseId":100,"checkSuite":{"app":{"databaseId":222}}}]}}}}}}'
+assert_eq "two apps both pass: required build not pending" "" \
+  "$(required_checks_pending "$(normalize_rollup "$ROLLUP_TWO_APPS_PASS")" "build")"
+assert_eq "two apps both pass: required build no failure" "" \
+  "$(required_checks_failures "$(normalize_rollup "$ROLLUP_TWO_APPS_PASS")" "build")"
 
 echo "# any_path_has_prefix"
 FILES_MIXED=$'SensrTrxMES/app/x.js\nPackManager/db/schema.rb'
