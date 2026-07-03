@@ -27,6 +27,40 @@ check_runs_payload_valid() {
   jq -e '(.check_runs | type) == "array"' <<<"$1" >/dev/null 2>&1
 }
 
+# True if $1 is a usable GraphQL statusCheckRollup response: no top-level errors
+# and the commit object resolved. (A resolved commit with no checks yet has a
+# null rollup, which is still usable -> normalizes to an empty set.)
+rollup_payload_valid() {
+  jq -e '(.errors | not) and (.data.repository.object != null)' <<<"$1" >/dev/null 2>&1
+}
+
+# Normalize a GraphQL statusCheckRollup response into the {check_runs:[...]} shape
+# the helpers below consume, so legacy StatusContexts (e.g. Buildkite) and Actions
+# CheckRuns are evaluated uniformly. StatusContext.state maps onto (status,
+# conclusion): SUCCESS -> completed/success; FAILURE|ERROR -> completed/failure;
+# PENDING|EXPECTED -> in_progress/none (i.e. not yet completed). CheckRun enums
+# are lowercased to match the REST vocabulary the helpers expect.
+normalize_rollup() {
+  jq '{
+    check_runs: [
+      (.data.repository.object.statusCheckRollup.contexts.nodes // [])[]
+      | if .__typename == "CheckRun" then
+          { name: .name,
+            status: ((.status // "") | ascii_downcase),
+            conclusion: (if .conclusion == null then null else (.conclusion | ascii_downcase) end),
+            started_at: .startedAt,
+            id: (.databaseId // 0) }
+        else
+          { name: .context,
+            status: (if (.state == "SUCCESS" or .state == "FAILURE" or .state == "ERROR") then "completed" else "in_progress" end),
+            conclusion: (if .state == "SUCCESS" then "success" elif (.state == "FAILURE" or .state == "ERROR") then "failure" else null end),
+            started_at: .createdAt,
+            id: 0 }
+        end
+    ]
+  }' <<<"$1"
+}
+
 # Count latest-per-name check-runs that have not finished yet.
 check_runs_incomplete_count() {
   jq -r "$_ci_jq_latest"'

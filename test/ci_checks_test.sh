@@ -122,6 +122,40 @@ assert_eq "null name ignored: none pending" "" "$(required_checks_pending "$NULL
 assert_eq "null name ignored: no failures" "" "$(required_checks_failures "$NULL_NAME" "e2e")"
 assert_eq "null name ignored: 0 incomplete" "0" "$(check_runs_incomplete_count "$NULL_NAME")"
 
+echo "# GraphQL statusCheckRollup: validity + normalization into the check-run model"
+ROLLUP_MIXED='{"data":{"repository":{"object":{"statusCheckRollup":{"state":"PENDING","contexts":{"nodes":[
+  {"__typename":"CheckRun","name":"e2e","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-07-02T17:07:17Z","databaseId":3},
+  {"__typename":"CheckRun","name":"test","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-07-02T17:07:15Z","databaseId":4},
+  {"__typename":"StatusContext","context":"buildkite/packmanager","state":"SUCCESS","createdAt":"2026-07-02T17:07:07Z"}]}}}}}}'
+ROLLUP_STATUS_FAIL='{"data":{"repository":{"object":{"statusCheckRollup":{"contexts":{"nodes":[
+  {"__typename":"StatusContext","context":"buildkite/packmanager","state":"FAILURE","createdAt":"2026-07-02T17:07:07Z"}]}}}}}}'
+ROLLUP_NULL='{"data":{"repository":{"object":{"statusCheckRollup":null}}}}'
+ROLLUP_ERROR='{"errors":[{"message":"Something went wrong"}]}'
+ROLLUP_NOOBJECT='{"data":{"repository":{"object":null}}}'
+
+assert_ok    "mixed rollup is valid"        rollup_payload_valid "$ROLLUP_MIXED"
+assert_ok    "null rollup (commit, no checks) is valid" rollup_payload_valid "$ROLLUP_NULL"
+assert_notok "errors payload invalid"       rollup_payload_valid "$ROLLUP_ERROR"
+assert_notok "unresolved commit invalid"    rollup_payload_valid "$ROLLUP_NOOBJECT"
+
+# Legacy status + check-runs evaluated uniformly after normalization.
+assert_eq "normalized: 1 incomplete (test in_progress)" "1" \
+  "$(check_runs_incomplete_count "$(normalize_rollup "$ROLLUP_MIXED")")"
+assert_eq "normalized: no failures" "" \
+  "$(check_runs_failures "$(normalize_rollup "$ROLLUP_MIXED")")"
+assert_eq "normalized: buildkite (a StatusContext) satisfies a required name" "" \
+  "$(required_checks_pending "$(normalize_rollup "$ROLLUP_MIXED")" "buildkite/packmanager,e2e")"
+assert_eq "normalized: in-progress required still pending" "test" \
+  "$(required_checks_pending "$(normalize_rollup "$ROLLUP_MIXED")" "test")"
+assert_eq "normalized: absent required still pending" "client_test" \
+  "$(required_checks_pending "$(normalize_rollup "$ROLLUP_MIXED")" "client_test")"
+assert_eq "normalized: a FAILURE legacy status is a failure" "buildkite/packmanager: failure" \
+  "$(check_runs_failures "$(normalize_rollup "$ROLLUP_STATUS_FAIL")")"
+assert_eq "normalized: required legacy status failure reported" "buildkite/packmanager: failure" \
+  "$(required_checks_failures "$(normalize_rollup "$ROLLUP_STATUS_FAIL")" "buildkite/packmanager")"
+assert_eq "normalized null rollup: 0 incomplete" "0" \
+  "$(check_runs_incomplete_count "$(normalize_rollup "$ROLLUP_NULL")")"
+
 echo "# any_path_has_prefix"
 FILES_MIXED=$'SensrTrxMES/app/x.js\nPackManager/db/schema.rb'
 FILES_PM_ONLY=$'PackManager/db/schema.rb\n.github/workflows/integrate.yml'
